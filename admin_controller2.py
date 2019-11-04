@@ -113,57 +113,61 @@ class SimpleSwitchRest13(simple_switch_13.SimpleSwitch13):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
+        if ev.msg.msg_len < ev.msg.total_len:
+            self.logger.debug("packet truncated: only %s of %s bytes",
+                              ev.msg.msg_len, ev.msg.total_len)
         msg = ev.msg
-        # print("#############################################")
         datapath = msg.datapath
-        dpid = datapath.id
-        port = msg.match['in_port']
-        pkt = packet.Packet(data=msg.data)
-        # self.logger.info("packet-in: %s" % (pkt,))
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+        in_port = msg.match['in_port']
 
+        pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
-
-        pkt_eth = pkt.get_protocol(ethernet.ethernet)
-        if pkt_eth:
-            dst_mac = pkt_eth.dst
-            eth_type = pkt_eth.ethertype
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             # ignore lldp packet
             return
 
+        dst = eth.dst
+        src = eth.src
+        dpid = datapath.id
+
         pkt_arp = pkt.get_protocol(arp.arp)
         if pkt_arp:
-            print("datapath id: " + str(dpid))
-            print("port: " + str(port))
-            print("pkt_eth.dst: " + str(pkt_eth.dst))
-            print("pkt_eth.src: " + str(pkt_eth.src))
-            print("pkt_arp: " + str(pkt_arp))
-            print("pkt_arp:src_ip: " + str(pkt_arp.src_ip))
-            print("pkt_arp:dst_ip: " + str(pkt_arp.dst_ip))
-            print("pkt_arp:src_mac: " + str(pkt_arp.src_mac))
-            print("pkt_arp:dst_mac: " + str(pkt_arp.dst_mac))
-
-            # Destination and source ip address
+            print(pkt_arp)
             d_ip = pkt_arp.dst_ip
             s_ip = pkt_arp.src_ip
 
-            # Destination and source mac address (HW address)
             d_mac = pkt_arp.dst_mac
             s_mac = pkt_arp.src_mac
 
             ip_to_mac = {}
             ip_to_mac["169.254.20.158"] = "b8:27:eb:17:0d:96"
             ip_to_mac["169.254.173.130"] = "b8:27:eb:7f:7c:ea"
-            in_port = msg.match['in_port']
-            dst_addr = ip_to_mac[d_ip]
+            dst_addr = ip_to_mac.get(d_ip)
 
-            self._handle_arp(datapath=datapath,
-                             port=in_port,
-                             pkt_ethernet=pkt.get_protocols(ethernet.ethernet)[0],
-                             pkt_arp=pkt_arp,
-                             target_hw_addr=dst_addr,
-                             target_ip_addr=d_ip)
+            if dst_addr:
+                print("HANDLE ARP")
+                self._handle_arp(datapath=datapath,
+                                 port=in_port,
+                                 pkt_ethernet=pkt.get_protocols(ethernet.ethernet)[0],
+                                 pkt_arp=pkt_arp,
+                                 target_hw_addr=dst_addr,
+                                 target_ip_addr=d_ip)
+        else:
+            for entry in self.forwarding_tables:
+                switch_id = entry['switch_id']
+                src_ip = entry['src_ip']
+                dst_ip = entry['dst_ip']
+                out_port = entry['out_port']
+
+                if dpid == switch_id:
+                    match = parser.OFPMatch(ipv4_src=src_ip, ipv4_dst=dst_ip, eth_type=ether.ETH_TYPE_IP)
+                    actions = [parser.OFPActionOutput(out_port)]
+                    self.add_flow(datapath, 1, match, actions)
+                    print("MATCH:")
+                    print(match)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -281,7 +285,6 @@ class SimpleSwitchController(ControllerBase):
     '''
     Return link list in our json format
     '''
-
     @route('get_topology', '/get_topology', methods=['GET'])
     def retrieve_links(self, req, **kwargs):
         simple_switch = self.simple_switch_app
@@ -348,7 +351,6 @@ class SimpleSwitchController(ControllerBase):
     '''
     Iterate over switches, delete all the flow, bring up all the interfaces
     '''
-
     @route('reset_topology', '/reset_topology', methods=['GET'])
     def reset_links(self, req, **kwargs):
         simple_switch = self.simple_switch_app
@@ -387,22 +389,14 @@ class SimpleSwitchController(ControllerBase):
         except Exception as e:
             return Response(status=500)
 
-        for entry in table_entries:
-            switch_id = entry['switch_id']
-            src_ip = entry['src_ip']
-            dst_ip = entry['dst_ip']
-            out_port = entry['out_port']
-            datapath = get_switch(simple_switch, switch_id)[0]
-            if datapath is not None:
-                parser = datapath.dp.ofproto_parser
-                ofproto = datapath.dp.ofproto
-                match = parser.OFPMatch(ipv4_src=src_ip, ipv4_dst=dst_ip, eth_type=ether.ETH_TYPE_IP)
-                actions = [parser.OFPActionOutput(out_port)]
-                inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-                flow_mod = parser.OFPFlowMod(datapath=datapath.dp, priority=1,
-                                             match=match, instructions=inst,
-                                             command=ofproto.OFPFC_ADD)
-                print("Set Table for switch: " + str(datapath.dp.id))
-                datapath.dp.send_msg(flow_mod)
-            else:
-                print("DATAPATH IS NONE")
+        switch_list = get_switch(simple_switch)
+        for switch in switch_list:
+            parser = switch.dp.ofproto_parser
+            # Removing flow via method:
+            # https://sourceforge.net/p/ryu/mailman/message/32333352/
+            empty_match = parser.OFPMatch()
+            # remove_table_flows() is in our main controller class
+            flow_mod = simple_switch.remove_table_flows(switch.dp, 0, empty_match, [])
+            switch.dp.send_msg(flow_mod)
+
+        self.simple_switch_app.forwarding_tables = table_entries
