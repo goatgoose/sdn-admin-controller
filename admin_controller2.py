@@ -17,6 +17,7 @@ from ryu.lib.packet import ethernet, ether_types
 from ryu.topology import event
 from ryu.topology.api import get_switch, get_link, get_all_link, get_all_switch
 from ryu.controller import dpset
+import requests
 
 from Graph import DirectedGraph
 from Node import KeyedNode
@@ -124,46 +125,59 @@ class SimpleSwitchRest13(simple_switch_13.SimpleSwitch13):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        if ev.msg.msg_len < ev.msg.total_len:
-            self.logger.debug("packet truncated: only %s of %s bytes",
-                              ev.msg.msg_len, ev.msg.total_len)
         msg = ev.msg
+        # print("#############################################")
         datapath = msg.datapath
-        ofproto = datapath.ofproto
+        dpid = datapath.id
         parser = datapath.ofproto_parser
-        in_port = msg.match['in_port']
+        ofproto = datapath.ofproto
+        port = msg.match['in_port']
+        pkt = packet.Packet(data=msg.data)
+        # self.logger.info("packet-in: %s" % (pkt,))
 
-        pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
+
+        pkt_eth = pkt.get_protocol(ethernet.ethernet)
+        if pkt_eth:
+            dst_mac = pkt_eth.dst
+            eth_type = pkt_eth.ethertype
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             # ignore lldp packet
             return
 
-        dst = eth.dst
-        src = eth.src
-        dpid = datapath.id
-
         pkt_arp = pkt.get_protocol(arp.arp)
         if pkt_arp:
-            print(pkt_arp)
+            print("datapath id: " + str(dpid))
+            print("port: " + str(port))
+            print("pkt_eth.dst: " + str(pkt_eth.dst))
+            print("pkt_eth.src: " + str(pkt_eth.src))
+            print("pkt_arp: " + str(pkt_arp))
+            print("pkt_arp:src_ip: " + str(pkt_arp.src_ip))
+            print("pkt_arp:dst_ip: " + str(pkt_arp.dst_ip))
+            print("pkt_arp:src_mac: " + str(pkt_arp.src_mac))
+            print("pkt_arp:dst_mac: " + str(pkt_arp.dst_mac))
+
+            # Destination and source ip address
             d_ip = pkt_arp.dst_ip
             s_ip = pkt_arp.src_ip
 
+            # Destination and source mac address (HW address)
             d_mac = pkt_arp.dst_mac
             s_mac = pkt_arp.src_mac
 
-            dst_addr = self.ip_to_mac.get(d_ip)
+            in_port = msg.match['in_port']
+            dst_addr = self.ip_to_mac[d_ip]
 
-            if dst_addr:
-                print("HANDLE ARP")
-                self._handle_arp(datapath=datapath,
-                                 port=in_port,
-                                 pkt_ethernet=pkt.get_protocols(ethernet.ethernet)[0],
-                                 pkt_arp=pkt_arp,
-                                 target_hw_addr=dst_addr,
-                                 target_ip_addr=d_ip)
+            self._handle_arp(datapath=datapath,
+                             port=in_port,
+                             pkt_ethernet=pkt.get_protocols(ethernet.ethernet)[0],
+                             pkt_arp=pkt_arp,
+                             target_hw_addr=dst_addr,
+                             target_ip_addr=d_ip)
         else:
+            print("OTHER")
+            print(pkt)
             for entry in self.forwarding_tables:
                 switch_id = entry['switch_id']
                 src_ip = entry['src_ip']
@@ -343,12 +357,17 @@ class SimpleSwitchController(ControllerBase):
         except Exception as e:
             return Response(status=500)
 
+        self.red_off(None)
+
         simple_switch = self.simple_switch_app
         link_list = get_link(simple_switch)
         queue = []
+        original_links = [(link.src.dpid, link.dst.dpid) for link in link_list]
+        down_links = []
         for link in link_list:
             src = link.src.dpid
             dst = link.dst.dpid
+
             if ([src, dst] not in config_list) and ([dst, src] not in config_list):
                 parser = get_switch(simple_switch, src)[0].dp.ofproto_parser
                 ofproto = get_switch(simple_switch, src)[0].dp.ofproto
@@ -362,6 +381,14 @@ class SimpleSwitchController(ControllerBase):
                                          config=(ofproto.OFPPC_NO_RECV | ofproto.OFPPC_NO_FWD),
                                          mask=(ofproto.OFPPC_NO_FWD | ofproto.OFPPC_NO_RECV))
                 queue.append([mod2, get_switch(simple_switch, dst)[0].dp])
+                down_links.append((src, dst))
+
+        original_links = set(original_links)
+        down_links = set(down_links)
+        up_links = original_links - down_links
+        for link in up_links:
+            requests.get("http://192.168.4." + str(link[0]) + ":1142/red_light_on")
+            requests.get("http://192.168.4." + str(link[1]) + ":1142/red_light_on")
 
         # We use a message queue to avoid changing the length
         # of link_list in our loop by turning off links.
@@ -409,14 +436,28 @@ class SimpleSwitchController(ControllerBase):
         except Exception as e:
             return Response(status=500)
 
-        switch_list = get_switch(simple_switch)
-        for switch in switch_list:
-            parser = switch.dp.ofproto_parser
-            # Removing flow via method:
-            # https://sourceforge.net/p/ryu/mailman/message/32333352/
-            empty_match = parser.OFPMatch()
-            # remove_table_flows() is in our main controller class
-            flow_mod = simple_switch.remove_table_flows(switch.dp, 0, empty_match, [])
-            switch.dp.send_msg(flow_mod)
-
         self.simple_switch_app.forwarding_tables = table_entries
+
+    @route('red_on', '/red_on', methods=['GET'])
+    def red_on(self, req, **kwargs):
+        for i in range(1, 12):
+            switch_ip = "http://192.168.4." + str(i) + ":1142"
+            requests.get(switch_ip + "/red_light_on")
+
+    @route('red_off', '/red_off', methods=['GET'])
+    def red_off(self, req, **kwargs):
+        for i in range(1, 12):
+            switch_ip = "http://192.168.4." + str(i) + ":1142"
+            requests.get(switch_ip + "/red_light_off")
+
+    @route('green_on', '/green_on', methods=['GET'])
+    def green_on(self, req, **kwargs):
+        for i in range(1, 12):
+            switch_ip = "http://192.168.4." + str(i) + ":1142"
+            requests.get(switch_ip + "/green_light_on")
+
+    @route('green_off', '/green_off', methods=['GET'])
+    def green_off(self, req, **kwargs):
+        for i in range(1, 12):
+            switch_ip = "http://192.168.4." + str(i) + ":1142"
+            requests.get(switch_ip + "/green_light_off")

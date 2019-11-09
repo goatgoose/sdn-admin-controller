@@ -172,6 +172,9 @@ class SimpleSwitchRest13(simple_switch_13.SimpleSwitch13):
                              pkt_arp=pkt_arp,
                              target_hw_addr=dst_addr,
                              target_ip_addr=d_ip)
+        else:
+            print("OTHER")
+            print(pkt)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
