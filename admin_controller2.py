@@ -53,6 +53,17 @@ class SimpleSwitchRest13(simple_switch_13.SimpleSwitch13):
         self.forwarding_tables = []
         self.mac_to_port = {}
 
+        self.ip_to_mac = {
+            "169.254.20.158": "b8:27:eb:17:0d:96",
+            "169.254.173.130": "b8:27:eb:7f:7c:ea",
+            "169.254.240.121": "b8:27:eb:81:61:47"
+        }
+        self.link_to_port = {
+            (1, "169.254.20.158"): 2,
+            (9, "169.254.173.130"): 16,
+            (8, "169.254.240.121"): 2
+        }
+
     def update_topology(self):
         self.graph = DirectedGraph()
 
@@ -142,10 +153,7 @@ class SimpleSwitchRest13(simple_switch_13.SimpleSwitch13):
             d_mac = pkt_arp.dst_mac
             s_mac = pkt_arp.src_mac
 
-            ip_to_mac = {}
-            ip_to_mac["169.254.20.158"] = "b8:27:eb:17:0d:96"
-            ip_to_mac["169.254.173.130"] = "b8:27:eb:7f:7c:ea"
-            dst_addr = ip_to_mac.get(d_ip)
+            dst_addr = self.ip_to_mac.get(d_ip)
 
             if dst_addr:
                 print("HANDLE ARP")
@@ -294,10 +302,22 @@ class SimpleSwitchController(ControllerBase):
         for link in link_list:
             connected.append([
                 link.src.dpid,
-                link.src.port_no,
                 link.dst.dpid,
-                link.dst.port_no
+                link.src.port_no
             ])
+
+        for link in simple_switch.link_to_port:
+            connected.append([
+                link[0],
+                link[1],
+                simple_switch.link_to_port[link]
+            ])
+            connected.append([
+                link[1],
+                link[0],
+                -1
+            ])
+
         self.simple_switch_app.update_topology()
 
         return Response(content_type='application/json',
